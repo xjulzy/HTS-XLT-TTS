@@ -1,316 +1,321 @@
 """
-Average the top-3 Stage-1 checkpoints selected by development loss.
+Stage 2: Extremely low-resource target-language adaptation.
 
-Selection:
-    1. Read Stage-1 development metrics.
-    2. Rank checkpoints by development loss.
-    3. Select the three checkpoints with the lowest dev loss.
-    4. Average their model parameters.
-    5. Save the averaged checkpoint as llm_avg3.pt.
+Stage 2 is initialized from the averaged Stage-1 checkpoint
+(llm_avg3.pt) and further adapted using extremely low-resource
+target-language data.
 
-The resulting checkpoint is used to initialize Stage 2.
+Only the language modeling module is optimized.
 """
 
 import argparse
-import json
+import random
+import subprocess
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Create the Stage-1 Avg3 checkpoint"
+        description="Stage 2 target-language adaptation"
     )
 
     parser.add_argument(
-        "--model-dir",
+        "--trainer",
         type=str,
         required=True,
-        help="Directory containing Stage-1 checkpoints",
+        help="Path to the CosyVoice3 LLM training script",
     )
 
     parser.add_argument(
-        "--metrics",
+        "--config",
         type=str,
-        default=None,
-        help="Stage-1 train_dev_metrics.jsonl",
+        required=True,
     )
 
     parser.add_argument(
-        "--output",
+        "--stage1-checkpoint",
+        type=str,
+        required=True,
+        help="Stage-1 Avg3 checkpoint (llm_avg3.pt)",
+    )
+
+    parser.add_argument(
+        "--train-data",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--cv-data",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--train-manifest",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--dev-manifest",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--qwen-pretrain-path",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--onnx-path",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--tensorboard-dir",
         type=str,
         default=None,
-        help="Output Avg3 checkpoint",
+    )
+
+    parser.add_argument(
+        "--max-train-steps",
+        type=int,
+        default=2000,
+    )
+
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=200,
+    )
+
+    parser.add_argument(
+        "--cv-interval",
+        type=int,
+        default=200,
+    )
+
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--prefetch",
+        type=int,
+        default=100,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=20260727,
+    )
+
+    parser.add_argument(
+        "--domain",
+        type=str,
+        default="TARGET",
+    )
+
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default="stage2_target",
     )
 
     return parser.parse_args()
 
 
-def read_dev_losses(metrics_file):
-    """
-    Read development loss for each evaluated training step.
-    """
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    dev_results = []
-
-    with open(metrics_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            record = json.loads(line)
-
-            if record.get("phase", "").lower() != "dev":
-                continue
-
-            step = int(record["step"])
-
-            dev_loss = record.get("dev_loss")
-
-            # Fallback for logs in which loss is stored in metrics.
-            if dev_loss is None:
-                metrics = record.get("metrics", {})
-
-                for key in [
-                    "loss",
-                    "llm_loss",
-                    "total_loss",
-                    "loss_total",
-                ]:
-                    if key in metrics:
-                        dev_loss = metrics[key]
-                        break
-
-            if dev_loss is None:
-                continue
-
-            dev_results.append(
-                {
-                    "step": step,
-                    "dev_loss": float(dev_loss),
-                }
-            )
-
-    return dev_results
-
-
-def select_top3(model_dir, dev_results):
-    """
-    Select the three available checkpoints with the lowest dev loss.
-    """
-
-    candidates = []
-
-    for item in dev_results:
-        step = item["step"]
-
-        checkpoint = model_dir / f"llm_step_{step}.pt"
-
-        if checkpoint.is_file():
-            candidates.append(
-                {
-                    "step": step,
-                    "dev_loss": item["dev_loss"],
-                    "checkpoint": checkpoint,
-                }
-            )
-
-    candidates.sort(
-        key=lambda x: x["dev_loss"]
-    )
-
-    if len(candidates) < 3:
-        raise RuntimeError(
-            f"Need at least 3 valid checkpoints, "
-            f"but only found {len(candidates)}."
-        )
-
-    return candidates[:3]
-
-
-def load_checkpoint(path):
-    checkpoint = torch.load(
-        path,
-        map_location="cpu",
-    )
-
-    if not isinstance(checkpoint, dict):
-        raise TypeError(
-            f"Checkpoint must be a dict: {path}"
-        )
-
-    return checkpoint
-
-
-def average_checkpoints(checkpoint_paths):
-    """
-    Average floating-point tensors across the selected checkpoints.
-
-    Non-floating tensors are copied from the first checkpoint.
-    """
-
-    states = [
-        load_checkpoint(path)
-        for path in checkpoint_paths
-    ]
-
-    reference_keys = set(states[0].keys())
-
-    for i, state in enumerate(states[1:], start=2):
-        if set(state.keys()) != reference_keys:
-            raise RuntimeError(
-                f"Checkpoint {i} has a different structure."
-            )
-
-    averaged = {}
-
-    for key in states[0].keys():
-        values = [
-            state[key]
-            for state in states
-        ]
-
-        first = values[0]
-
-        if torch.is_tensor(first):
-            if first.is_floating_point():
-                value = first.clone().float()
-
-                for tensor in values[1:]:
-                    value += tensor.float()
-
-                value /= len(values)
-
-                averaged[key] = value.to(
-                    dtype=first.dtype
-                )
-
-            else:
-                averaged[key] = first.clone()
-
-        else:
-            # Metadata such as step/epoch is not averaged.
-            averaged[key] = first
-
-    # Remove checkpoint-specific training metadata if present.
-    averaged.pop("step", None)
-    averaged.pop("epoch", None)
-
-    return averaged
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def main():
     args = parse_args()
 
-    model_dir = Path(args.model_dir)
+    set_seed(args.seed)
 
-    if args.metrics is None:
-        metrics_file = (
-            model_dir / "train_dev_metrics.jsonl"
-        )
-    else:
-        metrics_file = Path(args.metrics)
+    stage1_checkpoint = Path(
+        args.stage1_checkpoint
+    )
 
-    if args.output is None:
-        output_file = model_dir / "llm_avg3.pt"
-    else:
-        output_file = Path(args.output)
-
-    if not metrics_file.is_file():
+    if not stage1_checkpoint.is_file():
         raise FileNotFoundError(
-            f"Metrics file not found: {metrics_file}"
+            f"Stage-1 Avg3 checkpoint not found: "
+            f"{stage1_checkpoint}"
         )
 
-    dev_results = read_dev_losses(
-        metrics_file
+    output_dir = Path(
+        args.output_dir
     )
 
-    top3 = select_top3(
-        model_dir,
-        dev_results,
-    )
-
-    print("=" * 70)
-    print("Stage-1 checkpoint selection")
-    print("=" * 70)
-
-    for rank, item in enumerate(
-        top3,
-        start=1,
-    ):
-        print(
-            f"Top-{rank}: "
-            f"step={item['step']}, "
-            f"dev_loss={item['dev_loss']:.6f}, "
-            f"checkpoint={item['checkpoint']}"
-        )
-
-    checkpoint_paths = [
-        item["checkpoint"]
-        for item in top3
-    ]
-
-    averaged_state = average_checkpoints(
-        checkpoint_paths
-    )
-
-    output_file.parent.mkdir(
+    output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    torch.save(
-        averaged_state,
-        output_file,
+    if args.tensorboard_dir is None:
+        tensorboard_dir = (
+            output_dir / "tensorboard"
+        )
+    else:
+        tensorboard_dir = Path(
+            args.tensorboard_dir
+        )
+
+    tensorboard_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    manifest = {
-        "selection":
-            "top3_lowest_dev_loss_available_at_early_stop",
+    command = [
+        "python",
+        args.trainer,
 
-        "num_checkpoints": 3,
+        "--domain",
+        args.domain,
 
-        "top3": [
-            {
-                "rank": rank,
-                "step": item["step"],
-                "dev_loss": item["dev_loss"],
-                "checkpoint":
-                    str(item["checkpoint"]),
-            }
-            for rank, item in enumerate(
-                top3,
-                start=1,
-            )
-        ],
+        "--run_tag",
+        args.run_tag,
 
-        "output":
-            str(output_file),
-    }
+        "--train_engine",
+        "torch_ddp",
 
-    manifest_path = (
-        output_file.parent /
-        "avg3_manifest.json"
+        # Only adapt the language modeling module.
+        "--model",
+        "llm",
+
+        "--config",
+        args.config,
+
+        "--train_data",
+        args.train_data,
+
+        "--cv_data",
+        args.cv_data,
+
+        "--train_manifest",
+        args.train_manifest,
+
+        "--dev_manifest",
+        args.dev_manifest,
+
+        "--qwen_pretrain_path",
+        args.qwen_pretrain_path,
+
+        "--onnx_path",
+        args.onnx_path,
+
+        # Hierarchical transfer:
+        # initialize Stage 2 from the Stage-1 Avg3 model.
+        "--checkpoint",
+        str(stage1_checkpoint),
+
+        "--model_dir",
+        str(output_dir),
+
+        "--tensorboard_dir",
+        str(tensorboard_dir),
+
+        "--num_workers",
+        str(args.num_workers),
+
+        "--prefetch",
+        str(args.prefetch),
+
+        "--pin_memory",
+        "--use_amp",
+
+        "--dist_backend",
+        "nccl",
+
+        "--max_train_steps",
+        str(args.max_train_steps),
+
+        "--save_interval",
+        str(args.save_interval),
+
+        "--cv_interval",
+        str(args.cv_interval),
+
+        "--seed",
+        str(args.seed),
+
+        "--timeout",
+        "60",
+    ]
+
+    print("=" * 70)
+    print(
+        "Stage 2: Extremely low-resource "
+        "target-language adaptation"
+    )
+    print("=" * 70)
+
+    print(
+        f"Stage-1 Avg3 checkpoint : "
+        f"{stage1_checkpoint}"
     )
 
-    manifest_path.write_text(
-        json.dumps(
-            manifest,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    print(
+        f"Target training data    : "
+        f"{args.train_data}"
+    )
+
+    print(
+        f"Target development data : "
+        f"{args.cv_data}"
+    )
+
+    print(
+        f"Maximum steps           : "
+        f"{args.max_train_steps}"
+    )
+
+    print(
+        f"Save interval           : "
+        f"{args.save_interval}"
+    )
+
+    print(
+        f"CV interval             : "
+        f"{args.cv_interval}"
+    )
+
+    print(
+        f"Random seed             : "
+        f"{args.seed}"
+    )
+
+    print("=" * 70)
+
+    subprocess.run(
+        command,
+        check=True,
     )
 
     print()
-    print("=" * 70)
-    print("Avg3 checkpoint created")
-    print("=" * 70)
-    print(f"Output   : {output_file}")
-    print(f"Manifest : {manifest_path}")
+    print("Stage 2 finished.")
 
 
 if __name__ == "__main__":
